@@ -321,13 +321,20 @@ class ICSUploadView(APIView):
         except Exception:
             return Response({'error': 'Invalid .ics file'}, status=400)
 
+        import re
+        existing_titles = set(
+            Assignment.objects.filter(user=request.user).values_list('title', flat=True)
+        )
+
         created = []
         for component in cal.walk():
             if component.name != 'VEVENT':
                 continue
 
-            import re
-            title = str(component.get('SUMMARY', '')).strip()
+            title = str(component.get('SUMMARY', '')).strip() or '(No title)'
+            if title in existing_titles:
+                continue
+
             description = str(component.get('DESCRIPTION', '')).strip()
 
             match = re.search(r'\[([A-Z]+\s+\d{3})\b', title)
@@ -338,19 +345,18 @@ class ICSUploadView(APIView):
             if dtstart:
                 val = dtstart.dt
                 if hasattr(val, 'hour'):
-                    # Already a datetime
                     due_date = val if val.tzinfo else val.replace(tzinfo=ZoneInfo('UTC'))
                 else:
-                    # Date only — convert to midnight UTC datetime
                     due_date = datetime(val.year, val.month, val.day, tzinfo=ZoneInfo('UTC'))
 
             assignment = Assignment.objects.create(
                 user=request.user,
-                title=title or '(No title)',
+                title=title,
                 course=course,
                 due_date=due_date,
                 description=description,
             )
+            existing_titles.add(title)
             _analyze_assignment(assignment, request.user)
             created.append(assignment)
 
