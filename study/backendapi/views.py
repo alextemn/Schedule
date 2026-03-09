@@ -332,7 +332,7 @@ class AssignmentAnalyzeView(APIView):
         due = assignment.due_date.strftime('%Y-%m-%d %H:%M') if assignment.due_date else 'unknown'
 
         prompt = f"""You are an academic planning assistant. Analyze the following assignment and return a JSON object with exactly these fields:
-- estimated_hours (float): total estimated hours to complete
+- estimated_hours (float): total estimated hours to complete. make sure this is an accurate estimate as AI models tend to overestimate the time it takes to do an academic task. No task, unless it is exam preperation should take longer than 5 hours
 - difficulty (int 1-10): how difficult the assignment is
 - importance (int 1-10): how important it is to the course grade
 - urgency (int 1-10): how urgent given the due date
