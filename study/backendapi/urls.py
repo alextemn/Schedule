@@ -11,6 +11,7 @@ from .views import (
     AssignmentDeleteAllView,
     ICSUploadView,
     AssignmentAnalyzeView,
+    ScheduleView,
 )
 
 urlpatterns = [
@@ -25,4 +26,5 @@ urlpatterns = [
     path('assignments/all/', AssignmentDeleteAllView.as_view(), name='assignments-delete-all'),
     path('assignments/upload-ics/', ICSUploadView.as_view(), name='upload-ics'),
     path('assignments/<int:assignment_id>/analyze/', AssignmentAnalyzeView.as_view(), name='assignment-analyze'),
+    path('schedule/', ScheduleView.as_view(), name='schedule'),
 ]

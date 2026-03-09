@@ -1,7 +1,8 @@
+import heapq
 import secrets
 import urllib.parse
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from django.conf import settings
@@ -378,3 +379,141 @@ class AssignmentAnalyzeView(APIView):
 
         _analyze_assignment(assignment, request.user)
         return Response(AssignmentSerializer(assignment).data)
+
+
+# POST /api/schedule/
+class ScheduleView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def _post_event(self, user, event_body):
+        headers = {
+            'Authorization': f'Bearer {user.google_access_token}',
+            'Content-Type': 'application/json',
+        }
+        resp = requests.post(GOOGLE_CALENDAR_URL, headers=headers, json=event_body)
+        if resp.status_code == 401 and user.google_refresh_token:
+            token_resp = requests.post(GOOGLE_TOKEN_URL, data={
+                'client_id': settings.GOOGLE_CLIENT_ID,
+                'client_secret': settings.GOOGLE_CLIENT_SECRET,
+                'refresh_token': user.google_refresh_token,
+                'grant_type': 'refresh_token',
+            })
+            new_token = token_resp.json().get('access_token')
+            if new_token:
+                user.google_access_token = new_token
+                user.save(update_fields=['google_access_token'])
+                headers['Authorization'] = f'Bearer {new_token}'
+                resp = requests.post(GOOGLE_CALENDAR_URL, headers=headers, json=event_body)
+        return resp
+
+    def post(self, request):
+        user = request.user
+
+        if not user.google_connected:
+            return Response({'error': 'Google account not connected'}, status=403)
+        if not user.study_start or not user.study_end:
+            return Response({'error': 'Study window not set. Configure your study hours first.'}, status=400)
+
+        timezone_str = request.data.get('timezone', 'UTC')
+        try:
+            tz = ZoneInfo(timezone_str)
+        except ZoneInfoNotFoundError:
+            tz = ZoneInfo('UTC')
+
+        assignments = list(Assignment.objects.filter(
+            user=user,
+            due_date__isnull=False,
+            num_sessions__isnull=False,
+            recommended_session_minutes__isnull=False,
+            start_days_before_due__isnull=False,
+            urgency__isnull=False,
+        ))
+
+        if not assignments:
+            return Response({'scheduled': [], 'message': 'No analyzed assignments to schedule'})
+
+        today = datetime.now(tz).date()
+
+        # Build per-assignment scheduling state
+        items = []
+        for a in assignments:
+            due = a.due_date.astimezone(tz).date()
+            start = due - timedelta(days=a.start_days_before_due)
+            items.append({
+                'assignment': a,
+                'urgency': float(a.urgency),
+                'sessions_remaining': a.num_sessions,
+                'session_minutes': a.recommended_session_minutes,
+                'start_date': start,
+                'due_date': due,
+            })
+
+        study_start_min = user.study_start.hour * 60 + user.study_start.minute
+        study_end_min = user.study_end.hour * 60 + user.study_end.minute
+
+        # pending: items not yet added to the heap (sorted by start_date)
+        pending = sorted(items, key=lambda x: x['start_date'])
+        heap = []   # entries: (-urgency, counter, item)
+        counter = 0
+
+        earliest = min(max(today, i['start_date']) for i in items)
+        latest = max(i['due_date'] for i in items)
+        current_date = earliest
+
+        scheduled = []
+
+        while current_date <= latest:
+            # Activate assignments whose scheduling window has opened
+            still_pending = []
+            for item in pending:
+                if item['start_date'] <= current_date:
+                    heapq.heappush(heap, (-item['urgency'], counter, item))
+                    counter += 1
+                else:
+                    still_pending.append(item)
+            pending = still_pending
+
+            # Fill today's study window slot by slot
+            slot_min = study_start_min
+            while heap:
+                neg_urg, _, item = heap[0]  # peek
+
+                if slot_min + item['session_minutes'] > study_end_min:
+                    break  # no room left today
+
+                heapq.heappop(heap)
+
+                # Skip stale/expired items
+                if item['sessions_remaining'] <= 0 or current_date > item['due_date']:
+                    continue
+
+                h, m = divmod(slot_min, 60)
+                session_start = datetime(current_date.year, current_date.month, current_date.day, h, m, tzinfo=tz)
+                session_end = session_start + timedelta(minutes=item['session_minutes'])
+
+                session_num = item['assignment'].num_sessions - item['sessions_remaining'] + 1
+                event_body = {
+                    'summary': f"Study: {item['assignment'].title} (Session {session_num}/{item['assignment'].num_sessions})",
+                    'description': f"Course: {item['assignment'].course or 'Unknown'}\nDue: {item['due_date']}",
+                    'start': {'dateTime': session_start.isoformat()},
+                    'end': {'dateTime': session_end.isoformat()},
+                }
+
+                resp = self._post_event(user, event_body)
+                if resp.status_code in (200, 201):
+                    scheduled.append(resp.json())
+
+                slot_min += item['session_minutes']
+                item['sessions_remaining'] -= 1
+                item['urgency'] *= 2 / 3
+
+                if item['sessions_remaining'] > 0:
+                    heapq.heappush(heap, (-item['urgency'], counter, item))
+                    counter += 1
+
+            current_date += timedelta(days=1)
+
+            if not heap and not pending:
+                break
+
+        return Response({'scheduled': scheduled, 'count': len(scheduled)})
