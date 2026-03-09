@@ -17,8 +17,58 @@ from rest_framework.views import APIView
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework_simplejwt.tokens import RefreshToken, AccessToken
 
+import json
+from openai import OpenAI
+
 from .serializers import RegisterSerializer, UserSerializer, AssignmentSerializer
 from .models import Assignment
+
+
+def _analyze_assignment(assignment, user):
+    """Run AI analysis on an assignment and save results. Silently skips on error."""
+    client = OpenAI(api_key=settings.OPENAI_API_KEY)
+
+    study_window = ''
+    if user.study_start and user.study_end:
+        study_window = f"The student is available to study between {user.study_start.strftime('%H:%M')} and {user.study_end.strftime('%H:%M')}."
+
+    due = assignment.due_date.strftime('%Y-%m-%d %H:%M') if assignment.due_date else 'unknown'
+
+    prompt = f"""You are an academic planning assistant. Analyze the following assignment and return a JSON object with exactly these fields:
+- estimated_hours (float): total estimated hours to complete. make sure this is an accurate estimate as AI models tend to overestimate the time it takes to do an academic task. No task, unless it is exam preperation should take longer than 5 hours. Most small assignments such as labs or classwork take at most 1 hours. Assignments such as projects, exams, or assessments should take longer, even up to 10 hours
+- difficulty (int 1-10): how difficult the assignment is
+- importance (int 1-10): how important it is to the course grade
+- urgency (int 1-10): how urgent given the due date
+- recommended_session_minutes (int): ideal length of a single study session in minutes
+- num_sessions (int): recommended number of sessions to complete the work
+- start_days_before_due (int): how many days before the due date the student should start
+
+Assignment title: {assignment.title}
+Course: {assignment.course or 'Unknown'}
+Due date: {due}
+Description: {assignment.description or 'None'}
+{study_window}
+
+Respond with only the JSON object, no explanation."""
+
+    try:
+        response = client.chat.completions.create(
+            model='gpt-4o-mini',
+            response_format={'type': 'json_object'},
+            messages=[{'role': 'user', 'content': prompt}],
+        )
+        data = json.loads(response.choices[0].message.content)
+    except Exception:
+        return
+
+    assignment.estimated_hours = data.get('estimated_hours')
+    assignment.difficulty = data.get('difficulty')
+    assignment.importance = data.get('importance')
+    assignment.urgency = data.get('urgency')
+    assignment.recommended_session_minutes = data.get('recommended_session_minutes')
+    assignment.num_sessions = data.get('num_sessions')
+    assignment.start_days_before_due = data.get('start_days_before_due')
+    assignment.save()
 
 User = get_user_model()
 
@@ -301,6 +351,7 @@ class ICSUploadView(APIView):
                 due_date=due_date,
                 description=description,
             )
+            _analyze_assignment(assignment, request.user)
             created.append(assignment)
 
         return Response(
@@ -314,57 +365,10 @@ class AssignmentAnalyzeView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request, assignment_id):
-        import json
-        from openai import OpenAI
-
         try:
             assignment = Assignment.objects.get(pk=assignment_id, user=request.user)
         except Assignment.DoesNotExist:
             return Response({'error': 'Assignment not found'}, status=404)
 
-        client = OpenAI(api_key=settings.OPENAI_API_KEY)
-
-        user = request.user
-        study_window = ''
-        if user.study_start and user.study_end:
-            study_window = f"The student is available to study between {user.study_start.strftime('%H:%M')} and {user.study_end.strftime('%H:%M')}."
-
-        due = assignment.due_date.strftime('%Y-%m-%d %H:%M') if assignment.due_date else 'unknown'
-
-        prompt = f"""You are an academic planning assistant. Analyze the following assignment and return a JSON object with exactly these fields:
-- estimated_hours (float): total estimated hours to complete. make sure this is an accurate estimate as AI models tend to overestimate the time it takes to do an academic task. No task, unless it is exam preperation should take longer than 5 hours
-- difficulty (int 1-10): how difficult the assignment is
-- importance (int 1-10): how important it is to the course grade
-- urgency (int 1-10): how urgent given the due date
-- recommended_session_minutes (int): ideal length of a single study session in minutes
-- num_sessions (int): recommended number of sessions to complete the work
-- start_days_before_due (int): how many days before the due date the student should start
-
-Assignment title: {assignment.title}
-Course: {assignment.course or 'Unknown'}
-Due date: {due}
-Description: {assignment.description or 'None'}
-{study_window}
-
-Respond with only the JSON object, no explanation."""
-
-        try:
-            response = client.chat.completions.create(
-                model='gpt-4o-mini',
-                response_format={'type': 'json_object'},
-                messages=[{'role': 'user', 'content': prompt}],
-            )
-            data = json.loads(response.choices[0].message.content)
-        except Exception as e:
-            return Response({'error': str(e)}, status=500)
-
-        assignment.estimated_hours = data.get('estimated_hours')
-        assignment.difficulty = data.get('difficulty')
-        assignment.importance = data.get('importance')
-        assignment.urgency = data.get('urgency')
-        assignment.recommended_session_minutes = data.get('recommended_session_minutes')
-        assignment.num_sessions = data.get('num_sessions')
-        assignment.start_days_before_due = data.get('start_days_before_due')
-        assignment.save()
-
+        _analyze_assignment(assignment, request.user)
         return Response(AssignmentSerializer(assignment).data)
