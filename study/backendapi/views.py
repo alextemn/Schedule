@@ -502,10 +502,10 @@ class ScheduleView(APIView):
                 resp = self._post_event(user, event_body)
                 if resp.status_code in (200, 201):
                     scheduled.append(resp.json())
+                    item['sessions_remaining'] -= 1
+                    item['urgency'] *= 2 / 3
 
                 slot_min += item['session_minutes']
-                item['sessions_remaining'] -= 1
-                item['urgency'] *= 2 / 3
 
                 if item['sessions_remaining'] > 0:
                     heapq.heappush(heap, (-item['urgency'], counter, item))
