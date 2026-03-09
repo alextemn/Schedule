@@ -22,6 +22,8 @@ export default function DashboardPage() {
   const [studyHours, setStudyHours] = useState({ study_start: '', study_end: '' })
   const [studyHoursStatus, setStudyHoursStatus] = useState(null)
   const [savingHours, setSavingHours] = useState(false)
+  const [scheduling, setScheduling] = useState(false)
+  const [scheduleStatus, setScheduleStatus] = useState(null)
   const fileInputRef = useRef(null)
   const navigate = useNavigate()
 
@@ -145,6 +147,27 @@ export default function DashboardPage() {
     await apiFetch('/api/assignments/all/', { method: 'DELETE' })
     setAssignments([])
     setDeleting(false)
+  }
+
+  const handleSchedule = async () => {
+    setScheduling(true)
+    setScheduleStatus(null)
+    try {
+      const res = await apiFetch('/api/schedule/', {
+        method: 'POST',
+        body: JSON.stringify({ timezone: Intl.DateTimeFormat().resolvedOptions().timeZone }),
+      })
+      const data = await res.json()
+      if (res.ok) {
+        setScheduleStatus({ type: 'success', message: `Scheduled ${data.count} study session${data.count !== 1 ? 's' : ''} on your Google Calendar.` })
+      } else {
+        setScheduleStatus({ type: 'error', message: data.error || 'Scheduling failed' })
+      }
+    } catch (err) {
+      setScheduleStatus({ type: 'error', message: `Network error: ${err.message}` })
+    } finally {
+      setScheduling(false)
+    }
   }
 
   const handleICSUpload = async (e) => {
@@ -311,6 +334,24 @@ export default function DashboardPage() {
           </ul>
         )}
       </section>
+
+      {/* ── Schedule Study Sessions ─────────────────── */}
+      {assignments.length > 0 && user.google_connected && (
+        <section style={{ marginBottom: '40px' }}>
+          <h2 style={{ marginBottom: '8px' }}>Schedule Study Sessions</h2>
+          <p style={{ fontSize: '13px', color: '#555', marginBottom: '12px' }}>
+            Adds study blocks for all assignments to your Google Calendar using a priority queue ordered by urgency.
+          </p>
+          <button onClick={handleSchedule} disabled={scheduling} style={btnStyle}>
+            {scheduling ? 'Scheduling…' : 'Add to Google Calendar'}
+          </button>
+          {scheduleStatus && (
+            <p style={{ color: scheduleStatus.type === 'success' ? 'green' : 'red', marginTop: '8px' }}>
+              {scheduleStatus.message}
+            </p>
+          )}
+        </section>
+      )}
 
       {/* ── Add Calendar Event ───────────────────────── */}
       {!user.google_connected ? (
