@@ -1,24 +1,121 @@
-import json
+import secrets
 import urllib.parse
 import requests
-from datetime import datetime, timezone as dt_timezone
+from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
 from django.conf import settings
-from django.http import HttpResponseRedirect, JsonResponse
+from django.contrib.auth import get_user_model
+from django.http import HttpResponseRedirect
 from django.views import View
 from django.views.decorators.csrf import csrf_exempt
 from django.utils.decorators import method_decorator
 
+from rest_framework import status
+from rest_framework.response import Response
+from rest_framework.views import APIView
+from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework_simplejwt.tokens import RefreshToken, AccessToken
+
+from .serializers import RegisterSerializer, UserSerializer, AssignmentSerializer
+from .models import Assignment
+
+User = get_user_model()
 
 GOOGLE_AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth'
 GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token'
-GOOGLE_USERINFO_URL = 'https://www.googleapis.com/oauth2/v3/userinfo'
 GOOGLE_CALENDAR_URL = 'https://www.googleapis.com/calendar/v3/calendars/primary/events'
-FRONTEND_URL = 'http://localhost:5173'
 
 
-class GoogleLoginView(View):
+def tokens_for_user(user):
+    refresh = RefreshToken.for_user(user)
+    return {
+        'refresh': str(refresh),
+        'access': str(refresh.access_token),
+    }
+
+
+# POST /api/auth/register/
+class RegisterView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        serializer = RegisterSerializer(data=request.data)
+        if serializer.is_valid():
+            user = serializer.save()
+            return Response({
+                'user': UserSerializer(user).data,
+                **tokens_for_user(user),
+            }, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+# POST /api/auth/login/
+class LoginView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        email = request.data.get('email', '').strip().lower()
+        password = request.data.get('password', '')
+        try:
+            user = User.objects.get(email=email)
+        except User.DoesNotExist:
+            return Response({'error': 'Invalid credentials'}, status=status.HTTP_401_UNAUTHORIZED)
+        if not user.check_password(password):
+            return Response({'error': 'Invalid credentials'}, status=status.HTTP_401_UNAUTHORIZED)
+        return Response({
+            'user': UserSerializer(user).data,
+            **tokens_for_user(user),
+        })
+
+
+# GET + PATCH /api/auth/me/
+class MeView(APIView):
+    permission_classes = [IsAuthenticated]
+
     def get(self, request):
+        return Response(UserSerializer(request.user).data)
+
+    def patch(self, request):
+        from datetime import time as dt_time
+        start_str = request.data.get('study_start')
+        end_str = request.data.get('study_end')
+
+        if not start_str or not end_str:
+            return Response({'error': 'study_start and study_end are required'}, status=400)
+
+        try:
+            start = dt_time.fromisoformat(start_str)
+            end = dt_time.fromisoformat(end_str)
+        except ValueError:
+            return Response({'error': 'Invalid time format. Use HH:MM'}, status=400)
+
+        if start >= end:
+            return Response({'error': 'Start time must be before end time'}, status=400)
+
+        request.user.study_start = start
+        request.user.study_end = end
+        request.user.save(update_fields=['study_start', 'study_end'])
+        return Response(UserSerializer(request.user).data)
+
+
+# GET /api/auth/google/?token=<access_token>
+# Reads JWT from query param (browser redirects can't send headers), validates it,
+# then redirects to Google OAuth consent screen with user PK encoded in state.
+class GoogleLoginView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        frontend_url = getattr(settings, 'FRONTEND_URL', 'http://localhost:5173')
+        raw_token = request.GET.get('token', '')
+        try:
+            decoded = AccessToken(raw_token)
+            user_id = decoded['user_id']
+            user = User.objects.get(pk=user_id)
+        except Exception:
+            return HttpResponseRedirect(f'{frontend_url}/?google_error=invalid_token')
+
+        state = f"{user.pk}:{secrets.token_hex(16)}"
         params = {
             'client_id': settings.GOOGLE_CLIENT_ID,
             'redirect_uri': settings.GOOGLE_REDIRECT_URI,
@@ -26,18 +123,29 @@ class GoogleLoginView(View):
             'scope': 'openid email profile https://www.googleapis.com/auth/calendar.events',
             'access_type': 'offline',
             'prompt': 'consent',
+            'state': state,
         }
         url = GOOGLE_AUTH_URL + '?' + urllib.parse.urlencode(params)
         return HttpResponseRedirect(url)
 
 
+# GET /api/auth/google/callback/
+@method_decorator(csrf_exempt, name='dispatch')
 class GoogleCallbackView(View):
     def get(self, request):
+        frontend_url = getattr(settings, 'FRONTEND_URL', 'http://localhost:5173')
         code = request.GET.get('code')
         error = request.GET.get('error')
+        state = request.GET.get('state', '')
 
         if error or not code:
-            return HttpResponseRedirect(f'{FRONTEND_URL}?auth_error={error or "no_code"}')
+            return HttpResponseRedirect(f'{frontend_url}/?google_error={error or "no_code"}')
+
+        try:
+            user_pk = int(state.split(':')[0])
+            user = User.objects.get(pk=user_pk)
+        except (ValueError, IndexError, User.DoesNotExist):
+            return HttpResponseRedirect(f'{frontend_url}/?google_error=invalid_state')
 
         token_response = requests.post(GOOGLE_TOKEN_URL, data={
             'code': code,
@@ -49,59 +157,52 @@ class GoogleCallbackView(View):
         token_data = token_response.json()
 
         access_token = token_data.get('access_token')
+        refresh_token = token_data.get('refresh_token')
+
         if not access_token:
-            return HttpResponseRedirect(f'{FRONTEND_URL}?auth_error=token_exchange_failed')
+            return HttpResponseRedirect(f'{frontend_url}/?google_error=token_exchange_failed')
 
-        userinfo_response = requests.get(
-            GOOGLE_USERINFO_URL,
-            headers={'Authorization': f'Bearer {access_token}'},
-        )
-        user_info = userinfo_response.json()
-        user_info['access_token'] = access_token
+        user.google_access_token = access_token
+        if refresh_token:
+            user.google_refresh_token = refresh_token
+        user.save(update_fields=['google_access_token', 'google_refresh_token'])
 
-        encoded = urllib.parse.quote(json.dumps(user_info))
-        return HttpResponseRedirect(f'{FRONTEND_URL}?user={encoded}')
+        return HttpResponseRedirect(f'{frontend_url}/?google_linked=true')
 
 
-@method_decorator(csrf_exempt, name='dispatch')
-class CalendarEventsView(View):
-    def get(self, request):
-        access_token = request.GET.get('access_token')
-        if not access_token:
-            return JsonResponse({'error': 'access_token is required'}, status=400)
+# GET + POST /api/calendar/events/
+class CalendarEventsView(APIView):
+    permission_classes = [IsAuthenticated]
 
-        now = datetime.now(dt_timezone.utc).isoformat()
-        response = requests.get(
-            GOOGLE_CALENDAR_URL,
-            headers={'Authorization': f'Bearer {access_token}'},
-            params={
-                'timeMin': now,
-                'maxResults': 20,
-                'orderBy': 'startTime',
-                'singleEvents': 'true',
-            },
-        )
-
-        if response.status_code == 200:
-            return JsonResponse({'events': response.json().get('items', [])})
-        else:
-            return JsonResponse({'error': response.json()}, status=response.status_code)
+    def _refresh_google_token(self, user):
+        if not user.google_refresh_token:
+            return False
+        resp = requests.post(GOOGLE_TOKEN_URL, data={
+            'client_id': settings.GOOGLE_CLIENT_ID,
+            'client_secret': settings.GOOGLE_CLIENT_SECRET,
+            'refresh_token': user.google_refresh_token,
+            'grant_type': 'refresh_token',
+        })
+        new_token = resp.json().get('access_token')
+        if new_token:
+            user.google_access_token = new_token
+            user.save(update_fields=['google_access_token'])
+            return True
+        return False
 
     def post(self, request):
-        try:
-            body = json.loads(request.body)
-        except json.JSONDecodeError:
-            return JsonResponse({'error': 'Invalid JSON'}, status=400)
+        user = request.user
+        if not user.google_connected:
+            return Response({'error': 'Google account not connected'}, status=status.HTTP_403_FORBIDDEN)
 
-        access_token = body.get('access_token')
-        summary = body.get('summary', '').strip()
-        start_datetime = body.get('start_datetime')
-        end_datetime = body.get('end_datetime')
-        description = body.get('description', '')
-        timezone = body.get('timezone', 'UTC')
+        summary = request.data.get('summary', '').strip()
+        start_datetime = request.data.get('start_datetime')
+        end_datetime = request.data.get('end_datetime')
+        description = request.data.get('description', '')
+        timezone = request.data.get('timezone', 'UTC')
 
-        if not all([access_token, summary, start_datetime, end_datetime]):
-            return JsonResponse({'error': 'access_token, summary, start_datetime, and end_datetime are required'}, status=400)
+        if not all([summary, start_datetime, end_datetime]):
+            return Response({'error': 'summary, start_datetime, and end_datetime are required'}, status=400)
 
         try:
             tz = ZoneInfo(timezone)
@@ -116,7 +217,7 @@ class CalendarEventsView(View):
             start_rfc3339 = to_rfc3339(start_datetime)
             end_rfc3339 = to_rfc3339(end_datetime)
         except ValueError as e:
-            return JsonResponse({'error': f'Invalid datetime format: {e}'}, status=400)
+            return Response({'error': f'Invalid datetime format: {e}'}, status=400)
 
         event_body = {
             'summary': summary,
@@ -127,40 +228,143 @@ class CalendarEventsView(View):
 
         response = requests.post(
             GOOGLE_CALENDAR_URL,
-            headers={
-                'Authorization': f'Bearer {access_token}',
-                'Content-Type': 'application/json',
-            },
+            headers={'Authorization': f'Bearer {user.google_access_token}', 'Content-Type': 'application/json'},
             json=event_body,
         )
 
         if response.status_code in (200, 201):
-            event = response.json()
-            print('Created calendar event:', event)
-            return JsonResponse({'event': event}, status=201)
-        else:
-            return JsonResponse({'error': response.json()}, status=response.status_code)
+            return Response({'event': response.json()}, status=201)
+        return Response({'error': response.json()}, status=response.status_code)
 
 
-@method_decorator(csrf_exempt, name='dispatch')
-class DeleteCalendarEventView(View):
-    def delete(self, request, event_id):
+# GET /api/assignments/
+class AssignmentListView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        assignments = Assignment.objects.filter(user=request.user)
+        return Response(AssignmentSerializer(assignments, many=True).data)
+
+
+# DELETE /api/assignments/all/
+class AssignmentDeleteAllView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def delete(self, request):
+        Assignment.objects.filter(user=request.user).delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+# POST /api/assignments/upload-ics/
+class ICSUploadView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        from icalendar import Calendar
+
+        ics_file = request.FILES.get('file')
+        if not ics_file:
+            return Response({'error': 'No file provided'}, status=400)
+
         try:
-            body = json.loads(request.body)
-        except json.JSONDecodeError:
-            return JsonResponse({'error': 'Invalid JSON'}, status=400)
+            cal = Calendar.from_ical(ics_file.read())
+        except Exception:
+            return Response({'error': 'Invalid .ics file'}, status=400)
 
-        access_token = body.get('access_token')
-        if not access_token:
-            return JsonResponse({'error': 'access_token is required'}, status=400)
+        created = []
+        for component in cal.walk():
+            if component.name != 'VEVENT':
+                continue
 
-        response = requests.delete(
-            f'{GOOGLE_CALENDAR_URL}/{event_id}',
-            headers={'Authorization': f'Bearer {access_token}'},
+            import re
+            title = str(component.get('SUMMARY', '')).strip()
+            description = str(component.get('DESCRIPTION', '')).strip()
+
+            match = re.search(r'\[([A-Z]+\s+\d{3})\b', title)
+            course = match.group(1) if match else ''
+
+            dtstart = component.get('DTSTART')
+            due_date = None
+            if dtstart:
+                val = dtstart.dt
+                if hasattr(val, 'hour'):
+                    # Already a datetime
+                    due_date = val if val.tzinfo else val.replace(tzinfo=ZoneInfo('UTC'))
+                else:
+                    # Date only — convert to midnight UTC datetime
+                    due_date = datetime(val.year, val.month, val.day, tzinfo=ZoneInfo('UTC'))
+
+            assignment = Assignment.objects.create(
+                user=request.user,
+                title=title or '(No title)',
+                course=course,
+                due_date=due_date,
+                description=description,
+            )
+            created.append(assignment)
+
+        return Response(
+            AssignmentSerializer(created, many=True).data,
+            status=status.HTTP_201_CREATED,
         )
 
-        if response.status_code == 204:
-            print(f'Deleted calendar event: {event_id}')
-            return JsonResponse({'deleted': event_id})
-        else:
-            return JsonResponse({'error': response.json()}, status=response.status_code)
+
+# POST /api/assignments/<id>/analyze/
+class AssignmentAnalyzeView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, assignment_id):
+        import json
+        from openai import OpenAI
+
+        try:
+            assignment = Assignment.objects.get(pk=assignment_id, user=request.user)
+        except Assignment.DoesNotExist:
+            return Response({'error': 'Assignment not found'}, status=404)
+
+        client = OpenAI(api_key=settings.OPENAI_API_KEY)
+
+        user = request.user
+        study_window = ''
+        if user.study_start and user.study_end:
+            study_window = f"The student is available to study between {user.study_start.strftime('%H:%M')} and {user.study_end.strftime('%H:%M')}."
+
+        due = assignment.due_date.strftime('%Y-%m-%d %H:%M') if assignment.due_date else 'unknown'
+
+        prompt = f"""You are an academic planning assistant. Analyze the following assignment and return a JSON object with exactly these fields:
+- estimated_hours (float): total estimated hours to complete
+- difficulty (int 1-10): how difficult the assignment is
+- importance (int 1-10): how important it is to the course grade
+- urgency (int 1-10): how urgent given the due date
+- recommended_session_minutes (int): ideal length of a single study session in minutes
+- num_sessions (int): recommended number of sessions to complete the work
+- start_days_before_due (int): how many days before the due date the student should start
+
+Assignment title: {assignment.title}
+Course: {assignment.course or 'Unknown'}
+Due date: {due}
+Description: {assignment.description or 'None'}
+{study_window}
+
+Respond with only the JSON object, no explanation."""
+
+        try:
+            response = client.chat.completions.create(
+                model='gpt-4o-mini',
+                response_format={'type': 'json_object'},
+                messages=[{'role': 'user', 'content': prompt}],
+            )
+            data = json.loads(response.choices[0].message.content)
+        except Exception as e:
+            return Response({'error': str(e)}, status=500)
+
+        assignment.estimated_hours = data.get('estimated_hours')
+        assignment.difficulty = data.get('difficulty')
+        assignment.importance = data.get('importance')
+        assignment.urgency = data.get('urgency')
+        assignment.recommended_session_minutes = data.get('recommended_session_minutes')
+        assignment.num_sessions = data.get('num_sessions')
+        assignment.start_days_before_due = data.get('start_days_before_due')
+        assignment.save()
+
+        return Response(AssignmentSerializer(assignment).data)
