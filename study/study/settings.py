@@ -93,21 +93,29 @@ WSGI_APPLICATION = 'study.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
 
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.postgresql',
-        'NAME': 'railway',
-        'USER': 'postgres',
-        'PASSWORD': 'PjFXpKeNmyZHTJWMarrXzkUgbtVtMGXG',
-        'HOST': 'crossover.proxy.rlwy.net',
-        'PORT': '38316',
-        'CONN_MAX_AGE': 60,
-        'CONN_HEALTH_CHECKS': True,
-        'OPTIONS': {
-            'sslmode': 'require',
-        },
+if os.environ.get('TEST', '').lower() == 'true':
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': BASE_DIR / 'db.sqlite3',
+        }
     }
-}
+else:
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.postgresql',
+            'NAME': 'railway',
+            'USER': 'postgres',
+            'PASSWORD': 'PjFXpKeNmyZHTJWMarrXzkUgbtVtMGXG',
+            'HOST': 'crossover.proxy.rlwy.net',
+            'PORT': '38316',
+            'CONN_MAX_AGE': 60,
+            'CONN_HEALTH_CHECKS': True,
+            'OPTIONS': {
+                'sslmode': 'require',
+            },
+        }
+    }
 #postgresql://postgres:PjFXpKeNmyZHTJWMarrXzkUgbtVtMGXG@crossover.proxy.rlwy.net:38316/railway
 
 # Password validation
