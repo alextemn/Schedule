@@ -101,6 +101,11 @@ DATABASES = {
         'PASSWORD': 'PjFXpKeNmyZHTJWMarrXzkUgbtVtMGXG',
         'HOST': 'crossover.proxy.rlwy.net',
         'PORT': '38316',
+        'CONN_MAX_AGE': 60,
+        'CONN_HEALTH_CHECKS': True,
+        'OPTIONS': {
+            'sslmode': 'require',
+        },
     }
 }
 #postgresql://postgres:PjFXpKeNmyZHTJWMarrXzkUgbtVtMGXG@crossover.proxy.rlwy.net:38316/railway
